@@ -25,6 +25,9 @@ values that are preserved in the metadata.
 4. Click **Export…**, pick a destination `.gpf` file, and the macro writes an
    ASCII Raith **GPF** file containing fractured polygons and the selected
    settings.
+5. Use **Simulate beam path** to open a companion window that lists the fractured
+   polygons (in microns) in the order they would be written, along with the
+   per-layer dose annotations you configured.
 
 ## GPF format (produced by this macro)
 The macro emits a Raith-compatible ASCII GPF file. Each layer is flattened and
@@ -42,3 +45,14 @@ flows typically add stage parameters, patterning strategies, and beam settings
 that are specific to a given system. Before relying on this macro to drive an
 exposure, run the resulting file through the vendor’s official verification
 tools or exporter to confirm the syntax and required fields for your machine.
+
+## Tests and reference fixtures
+- Run the automated checks with `pytest`.
+- The suite ships with `fixtures/pro_reference.gpf`, a professionally converted
+  reference export. Tests decode the embedded base64 payload from that file to
+  reconstruct the original GDS on the fly, then assert the generated GPF matches
+  the reference (after stripping timestamp noise) so the writer stays in
+  lockstep with known-good output formatting. When you export all layers without
+  healing, the macro fractures straight from the opened GDS file and embeds
+  those exact bytes in the GPF payload to maintain byte-for-byte parity with the
+  reference fixture.

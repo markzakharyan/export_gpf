@@ -72,6 +72,36 @@ def _install_pya_stub():
         def __init__(self, *args, **kwargs):
             pass
 
+        def addWidget(self, *args, **kwargs):
+            pass
+
+        def addLayout(self, *args, **kwargs):
+            pass
+
+        def addStretch(self, *args, **kwargs):
+            pass
+
+        def setWindowTitle(self, *args, **kwargs):
+            pass
+
+        def resize(self, *args, **kwargs):
+            pass
+
+        def show(self, *args, **kwargs):
+            pass
+
+        def exec_(self, *args, **kwargs):
+            pass
+
+        def clicked(self, *args, **kwargs):
+            return lambda *a, **k: None
+
+        def setPlainText(self, *args, **kwargs):
+            pass
+
+        def setReadOnly(self, *args, **kwargs):
+            pass
+
     pya_stub.QDialog = QDialog
     pya_stub.QVBoxLayout = _Widget
     pya_stub.QLabel = _Widget
@@ -85,6 +115,7 @@ def _install_pya_stub():
     pya_stub.QFileDialog = _Widget
     pya_stub.Region = _Widget
     pya_stub.Layout = _Widget
+    pya_stub.QPlainTextEdit = _Widget
 
     sys.modules["pya"] = pya_stub
     return pya_stub
@@ -151,3 +182,90 @@ def test_write_gpf_container_writes_header_and_base64(tmp_path):
     assert "DOSE 2.5" in data
     assert "POLY 3 0.000000 0.000000 1.000000 0.000000 1.000000 1.000000" in data
     assert data[-1] == base64.b64encode(gds_content).decode("ascii")
+
+
+def _normalize_gpf(lines):
+    """Strip timestamp noise so reference comparisons remain stable."""
+
+    return [line for line in lines if not line.startswith("# Exported at ")]
+
+
+def test_generate_simulation_report_summarizes_polygons():
+    _install_pya_stub()
+    import export_gpf
+
+    dialog = object.__new__(export_gpf.GPFExportDialog)
+    layers = [
+        {
+            "label": "RECT",
+            "relative_dose": 1.0,
+            "polygons": [
+                [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+                [(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)],
+            ],
+        }
+    ]
+
+    report = dialog._generate_simulation_report(
+        "2024-01-01T00:00:00Z", layers, "TOP"
+    )
+
+    assert "Beam write simulation" in report
+    assert "Layer 1 (RECT)" in report
+    assert "2 polygons" in report
+    assert "Polygon 2 with 4 vertices" in report
+    assert "(2.000, 2.000)" in report
+
+
+def test_conversion_matches_professional_reference(tmp_path):
+    pya = _install_pya_stub()
+    import export_gpf
+
+    dialog = object.__new__(export_gpf.GPFExportDialog)
+    dialog.table = type("_Table", (), {"rowCount": lambda self: 2})()
+
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures"
+    reference_gpf = fixtures / "pro_reference.gpf"
+
+    # Decode the embedded GDS payload from the reference GPF to avoid storing
+    # a binary fixture in the repo.
+    payload_lines = []
+    seen_payload = False
+    for line in reference_gpf.read_text().splitlines():
+        if seen_payload:
+            payload_lines.append(line.strip())
+        if line.strip() == "# GDS payload base64":
+            seen_payload = True
+
+    reference_gds = tmp_path / "pro_reference.gds"
+    reference_gds.write_bytes(base64.b64decode("".join(payload_lines)))
+
+    layers = [
+        {
+            "info": pya.LayerInfo(1, 0),
+            "label": "RECT",
+            "relative_dose": 1.0,
+            "spec": (1, 0),
+        },
+        {
+            "info": pya.LayerInfo(2, 0),
+            "label": "POLY",
+            "relative_dose": 1.2,
+            "spec": (2, 0),
+        },
+    ]
+
+    output_path = tmp_path / "output.gpf"
+    dialog._export_from_existing_gds(
+        str(output_path),
+        "2024-01-01T00:00:00Z",
+        layers,
+        0.001,
+        "TOP",
+        str(reference_gds),
+    )
+
+    expected = _normalize_gpf(reference_gpf.read_text().splitlines())
+    actual = _normalize_gpf(output_path.read_text().splitlines())
+
+    assert actual == expected

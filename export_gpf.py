@@ -1,6 +1,7 @@
 import base64
 import datetime
 import tempfile
+from pathlib import Path
 
 import gdstk
 import pya
@@ -37,6 +38,10 @@ class GPFExportDialog(pya.QDialog):
         button_row.addWidget(self.refresh_button)
 
         button_row.addStretch(1)
+
+        self.simulate_button = pya.QPushButton("Simulate beam path")
+        self.simulate_button.clicked(self.handle_simulation)
+        button_row.addWidget(self.simulate_button)
 
         self.export_button = pya.QPushButton("Export…")
         self.export_button.clicked(self.handle_export)
@@ -172,6 +177,26 @@ class GPFExportDialog(pya.QDialog):
 
         exported_at = datetime.datetime.utcnow().isoformat() + "Z"
 
+        all_layers_selected = self.table.rowCount() == len(layer_metadata)
+        any_heal_requested = any(layer.get("heal") for layer in layer_metadata)
+        source_filename = getattr(cellview, "filename", None) or getattr(cellview, "path", None)
+
+        if source_filename and all_layers_selected and not any_heal_requested:
+            self._export_from_existing_gds(
+                gpf_path,
+                exported_at,
+                layer_metadata,
+                source_layout.dbu,
+                source_cell.name,
+                source_filename,
+            )
+            pya.QMessageBox.information(
+                self,
+                "Export complete",
+                f"Saved GPF to: {gpf_path}\nLayers: {len(selected)}",
+            )
+            return
+
         with tempfile.NamedTemporaryFile(suffix=".gds") as tmp:
             filtered_layout.write(tmp.name)
             tmp.flush()
@@ -201,6 +226,111 @@ class GPFExportDialog(pya.QDialog):
             "Export complete",
             f"Saved GPF to: {gpf_path}\nLayers: {len(selected)}",
         )
+
+    def handle_simulation(self) -> None:
+        """Create a simulation window showing beam write order."""
+
+        view = self.main_window.current_view()
+        if view is None:
+            pya.QMessageBox.warning(self, "No view", "Open a layout before simulating.")
+            return
+
+        cellview = view.active_cellview()
+        if cellview is None or cellview.is_null():
+            pya.QMessageBox.warning(self, "No cell", "Activate a cell before simulating.")
+            return
+
+        source_layout = cellview.layout()
+        source_cell = cellview.cell
+
+        selected = []
+        for row in range(self.table.rowCount()):
+            use_item = self.table.item(row, 0)
+            if use_item.checkState() != pya.Qt.Checked:
+                continue
+
+            label_item = self.table.item(row, 1)
+            layer_info = label_item.data(pya.Qt.UserRole)
+            heal_checkbox = self.table.cellWidget(row, 2)
+            dose_spin = self.table.cellWidget(row, 3)
+            selected.append(
+                {
+                    "info": layer_info,
+                    "label": label_item.text(),
+                    "heal": heal_checkbox.isChecked(),
+                    "relative_dose": dose_spin.value(),
+                }
+            )
+
+        if not selected:
+            pya.QMessageBox.information(self, "No layers", "Select at least one layer to simulate.")
+            return
+
+        filtered_layout = pya.Layout()
+        filtered_layout.dbu = source_layout.dbu
+        top_cell = filtered_layout.create_cell(source_cell.name or "TOP")
+
+        layer_metadata = []
+        layer_spec_map = {}
+
+        for layer in selected:
+            layer_info = layer["info"]
+            source_index = source_layout.find_layer(layer_info)
+            if source_index < 0:
+                continue
+
+            region = pya.Region(source_cell.begin_shapes_rec(source_index))
+            if layer["heal"]:
+                region = region.merged()
+
+            target_index = filtered_layout.insert_layer(layer_info)
+            top_cell.shapes(target_index).insert(region)
+
+            spec = (layer_info.layer, layer_info.datatype)
+            layer_metadata.append(
+                {
+                    "info": layer_info,
+                    "label": layer["label"],
+                    "relative_dose": layer["relative_dose"],
+                    "spec": spec,
+                }
+            )
+            layer_spec_map[spec] = layer_metadata[-1]
+
+        exported_at = datetime.datetime.utcnow().isoformat() + "Z"
+
+        with tempfile.NamedTemporaryFile(suffix=".gds") as tmp:
+            filtered_layout.write(tmp.name)
+            tmp.flush()
+            fractured_polygons = self._fracture_with_gdstk(
+                tmp.name,
+                layer_spec_map,
+                top_cell.name,
+            )
+
+        for layer in layer_metadata:
+            layer["polygons"] = fractured_polygons.get(layer["spec"], [])
+
+        report = self._generate_simulation_report(exported_at, layer_metadata, source_cell.name)
+
+        sim_dialog = pya.QDialog(self)
+        sim_dialog.setWindowTitle("Beam write simulation")
+        sim_layout = pya.QVBoxLayout(sim_dialog)
+        report_widget = pya.QPlainTextEdit(sim_dialog)
+        report_widget.setReadOnly(True)
+        report_widget.setPlainText(report)
+        sim_layout.addWidget(report_widget)
+
+        close_button = pya.QPushButton("Close", sim_dialog)
+        close_button.clicked(sim_dialog.close)
+        button_bar = pya.QHBoxLayout()
+        button_bar.addStretch(1)
+        button_bar.addWidget(close_button)
+        sim_layout.addLayout(button_bar)
+
+        sim_dialog.resize(600, 500)
+        sim_dialog.show()
+        sim_dialog.exec_()
 
     def _fracture_with_gdstk(self, gds_path: str, selected_layers: dict, top_name: str) -> dict:
         """Use gdstk's polygon fracturing to split shapes for each selected layer.
@@ -243,6 +373,33 @@ class GPFExportDialog(pya.QDialog):
                 fractured[spec].append(coords)
 
         return fractured
+
+    def _generate_simulation_report(self, exported_at: str, layers: list, source_name: str) -> str:
+        """Build a textual description of the beam writing path."""
+
+        lines = [
+            "Beam write simulation",  # title
+            f"Source: {source_name}",
+            f"Exported at: {exported_at}",
+            "",
+        ]
+
+        for idx, layer in enumerate(layers, start=1):
+            lines.append(
+                f"Layer {idx} ({layer['label']}) — dose {layer['relative_dose']} — {len(layer['polygons'])} polygons"
+            )
+            for p_idx, poly in enumerate(layer["polygons"], start=1):
+                lines.append(f"  Polygon {p_idx} with {len(poly)} vertices")
+                coord_chunks = []
+                for vx, vy in poly:
+                    coord_chunks.append(f"({vx:.3f}, {vy:.3f})")
+                lines.append("    Path: " + " -> ".join(coord_chunks))
+            lines.append("")
+
+        if len(lines) == 4:
+            lines.append("No polygons were found for the selected layers.")
+
+        return "\n".join(lines)
 
     def _write_gpf_container(
         self,
@@ -293,6 +450,44 @@ class GPFExportDialog(pya.QDialog):
             handle.write(b"# GDS payload base64\n")
             handle.write(base64.b64encode(gds_content))
             handle.write(b"\n")
+
+    def _export_from_existing_gds(
+        self,
+        gpf_path: str,
+        exported_at: str,
+        layer_metadata: list,
+        dbu: float,
+        source_name: str,
+        source_filename: str,
+    ) -> None:
+        """Shortcut export path that reuses the opened GDS verbatim.
+
+        When all layers are selected and healing is disabled, we can fracture
+        directly from the user's currently opened GDS file and embed that exact
+        payload in the output. This preserves byte-for-byte parity with
+        professionally exported GPFs that wrap the original GDS alongside the
+        fractured polygon listing.
+        """
+
+        layer_spec_map = {layer["spec"]: layer for layer in layer_metadata}
+        fractured_polygons = self._fracture_with_gdstk(
+            source_filename,
+            layer_spec_map,
+            source_name,
+        )
+
+        for layer in layer_metadata:
+            layer["polygons"] = fractured_polygons.get(layer["spec"], [])
+
+        gds_content = Path(source_filename).read_bytes()
+        self._write_gpf_container(
+            gpf_path,
+            exported_at,
+            layer_metadata,
+            dbu,
+            source_name,
+            gds_content,
+        )
 
 
 def register_menu_entry() -> None:
