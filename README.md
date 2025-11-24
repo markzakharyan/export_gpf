@@ -6,14 +6,13 @@ keep, optionally heal (merge) polygons before export, and assign relative dose
 values that are preserved in the metadata.
 
 ## Installation
-1. Install the Python **gdstk** package into the Python environment KLayout uses
-   for macros (the dialog relies on gdstk for polygon fracturing and layer
-   extraction).
-2. Copy `export_gpf.py` into a folder KLayout can reach (e.g. *Macros > Manage
-   Macros… > Add*).
-3. Make sure the macro is set to **autorun on application start** so the menu
-   entry is registered.
-4. Restart KLayout if necessary.
+1. Run `./install.sh` to install Python dependencies, download Yale Freebeam
+   (via the `FREEBEAM_URL` mirror), and copy the macro into your KLayout macros
+   directory. The script installs a `gpfout` binary under `~/.local/freebeam`
+   and symlinks it into `~/.local/bin` so the macro can find it automatically.
+2. Ensure the macro is set to **autorun on application start** so the menu entry
+   is registered.
+3. Restart KLayout if necessary.
 
 ## Usage
 1. Open the GDS/OASIS layout you want to convert.
@@ -22,21 +21,21 @@ values that are preserved in the metadata.
    - **Use** toggles whether the layer is included.
    - **Heal** merges shapes on that layer before export.
    - **Relative dose** stores a numeric multiplier in the exported metadata.
-4. Click **Export…**, pick a destination `.gpf` file, and the macro writes an
-   ASCII Raith **GPF** file containing fractured polygons and the selected
-   settings.
+4. Click **Export…**, pick a destination `.gpf` file, and the macro passes the
+   filtered layout to Yale **Freebeam** `gpfout` for GPF generation. Exports are
+   blocked if `gpfout` is not installed.
 5. Use **Simulate beam path** to open a companion window that lists the fractured
    polygons (in microns) in the order they would be written, along with the
    per-layer dose annotations you configured.
 
 ## GPF format (produced by this macro)
-The macro emits a Raith-compatible ASCII GPF file. Each layer is flattened and
-fractured into trapezoids or polygons with four or fewer vertices, written as
-`POLY` records under a `LAYER` block along with the relative dose value you
-assign in the dialog. Geometry is fractured via **gdstk** with a four-vertex
-limit, producing trapezoids/triangles compatible with Raith tools. The header
-includes the export timestamp, database unit, and source cell name, and the
-tail of the file embeds a base64-encoded GDS snapshot for reference.
+Exports always invoke the Yale **Freebeam** toolchain, passing layer extents,
+block sizing, and a temporary relative-dose file to the `gpfout` binary. Each
+layer is flattened and fractured into trapezoids or polygons with four or fewer
+vertices, written as `POLY` records under a `LAYER` block along with the
+relative dose value you assign in the dialog. Geometry is fractured via
+**gdstk** with a four-vertex limit, producing trapezoids/triangles compatible
+with Raith tools.
 
 ## Compatibility notice
 The generator here writes a **simplified** ASCII GPF that follows public Raith
@@ -50,9 +49,5 @@ tools or exporter to confirm the syntax and required fields for your machine.
 - Run the automated checks with `pytest`.
 - The suite ships with `fixtures/pro_reference.gpf`, a professionally converted
   reference export. Tests decode the embedded base64 payload from that file to
-  reconstruct the original GDS on the fly, then assert the generated GPF matches
-  the reference (after stripping timestamp noise) so the writer stays in
-  lockstep with known-good output formatting. When you export all layers without
-  healing, the macro fractures straight from the opened GDS file and embeds
-  those exact bytes in the GPF payload to maintain byte-for-byte parity with the
-  reference fixture.
+  reconstruct the original GDS on the fly and stub a `gpfout` binary so the
+  Freebeam export path can be exercised without the real tool.

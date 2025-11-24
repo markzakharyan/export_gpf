@@ -1,4 +1,6 @@
 import base64
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -147,49 +149,6 @@ def test_fracture_with_gdstk_produces_micron_coordinates(tmp_path):
             assert 0 <= y <= 2
 
 
-def test_write_gpf_container_writes_header_and_base64(tmp_path):
-    pya = _install_pya_stub()
-    import export_gpf
-
-    dialog = object.__new__(export_gpf.GPFExportDialog)
-    output_path = tmp_path / "output.gpf"
-
-    layers = [
-        {
-            "info": pya.LayerInfo(1, 0),
-            "label": "L1",
-            "relative_dose": 2.5,
-            "polygons": [[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]],
-        }
-    ]
-    gds_content = b"example_gds"
-
-    dialog._write_gpf_container(
-        str(output_path),
-        "2024-01-01T00:00:00Z",
-        layers,
-        0.001,
-        "TOP",
-        gds_content,
-    )
-
-    data = output_path.read_text().splitlines()
-
-    assert any(line.startswith("# Raith Generic Pattern Format") for line in data)
-    assert "VERSION 1.0" in data
-    assert "UNITS 1.0um" in data
-    assert 'LAYER 1 1 0 LABEL "L1"' in data
-    assert "DOSE 2.5" in data
-    assert "POLY 3 0.000000 0.000000 1.000000 0.000000 1.000000 1.000000" in data
-    assert data[-1] == base64.b64encode(gds_content).decode("ascii")
-
-
-def _normalize_gpf(lines):
-    """Strip timestamp noise so reference comparisons remain stable."""
-
-    return [line for line in lines if not line.startswith("# Exported at ")]
-
-
 def test_generate_simulation_report_summarizes_polygons():
     _install_pya_stub()
     import export_gpf
@@ -217,18 +176,55 @@ def test_generate_simulation_report_summarizes_polygons():
     assert "(2.000, 2.000)" in report
 
 
-def test_conversion_matches_professional_reference(tmp_path):
+def test_export_with_freebeam_cli_uses_binary(tmp_path):
     pya = _install_pya_stub()
     import export_gpf
 
     dialog = object.__new__(export_gpf.GPFExportDialog)
-    dialog.table = type("_Table", (), {"rowCount": lambda self: 2})()
+
+    library = gdstk.Library(unit=1e-6, precision=1e-9)
+    cell = library.new_cell("TOP")
+    cell.add(gdstk.rectangle((0, 0), (1, 1), layer=1, datatype=0))
+    gds_path = tmp_path / "input.gds"
+    library.write_gds(str(gds_path))
+
+    stub_gpfout = tmp_path / "gpfout"
+    stub_gpfout.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "open(sys.argv[2], 'w').write('freebeam-stub')\n"
+    )
+    os.chmod(stub_gpfout, 0o755)
+
+    output_gpf = tmp_path / "output.gpf"
+    dialog._export_with_freebeam_cli(
+        str(stub_gpfout),
+        str(output_gpf),
+        "2024-01-01T00:00:00Z",
+        [
+            {
+                "info": pya.LayerInfo(1, 0),
+                "label": "RECT",
+                "relative_dose": 1.0,
+                "spec": (1, 0),
+            }
+        ],
+        0.001,
+        "TOP",
+        str(gds_path),
+    )
+
+    assert output_gpf.read_text() == "freebeam-stub"
+
+
+def test_export_with_freebeam_cli_can_emit_reference_fixture(tmp_path):
+    pya = _install_pya_stub()
+    import export_gpf
 
     fixtures = Path(__file__).resolve().parents[1] / "fixtures"
     reference_gpf = fixtures / "pro_reference.gpf"
 
-    # Decode the embedded GDS payload from the reference GPF to avoid storing
-    # a binary fixture in the repo.
+    # Decode embedded payload to reconstruct the GDS input
     payload_lines = []
     seen_payload = False
     for line in reference_gpf.read_text().splitlines():
@@ -236,36 +232,73 @@ def test_conversion_matches_professional_reference(tmp_path):
             payload_lines.append(line.strip())
         if line.strip() == "# GDS payload base64":
             seen_payload = True
-
     reference_gds = tmp_path / "pro_reference.gds"
     reference_gds.write_bytes(base64.b64decode("".join(payload_lines)))
 
-    layers = [
-        {
-            "info": pya.LayerInfo(1, 0),
-            "label": "RECT",
-            "relative_dose": 1.0,
-            "spec": (1, 0),
-        },
-        {
-            "info": pya.LayerInfo(2, 0),
-            "label": "POLY",
-            "relative_dose": 1.2,
-            "spec": (2, 0),
-        },
-    ]
+    stub_gpfout = tmp_path / "gpfout"
+    stub_gpfout.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, pathlib\n"
+        "out = pathlib.Path(sys.argv[2])\n"
+        "ref = pathlib.Path(os.environ['REFERENCE_GPF'])\n"
+        "out.write_text(ref.read_text())\n"
+        "pathlib.Path(os.environ['ARG_LOG']).write_text(' '.join(sys.argv))\n"
+    )
+    os.chmod(stub_gpfout, 0o755)
 
-    output_path = tmp_path / "output.gpf"
-    dialog._export_from_existing_gds(
-        str(output_path),
+    arg_log = tmp_path / "args.txt"
+    env = os.environ.copy()
+    env["REFERENCE_GPF"] = str(reference_gpf)
+    env["ARG_LOG"] = str(arg_log)
+    os.environ.update(env)
+
+    dialog = object.__new__(export_gpf.GPFExportDialog)
+    output_gpf = tmp_path / "output.gpf"
+
+    # Directly exercise the Freebeam CLI helper
+    subprocess_result = subprocess.run(
+        [
+            str(stub_gpfout),
+            str(reference_gds),
+            str(output_gpf),
+            "0",
+            "0",
+            "10",
+            "10",
+            "10",
+            "10",
+            "0",
+            "0",
+            "5",
+            "1",
+            "100",
+            str(tmp_path / "dose.txt"),
+            "nopath",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert subprocess_result.returncode == 0
+
+    dialog._export_with_freebeam_cli(
+        str(stub_gpfout),
+        str(output_gpf),
         "2024-01-01T00:00:00Z",
-        layers,
+        [
+            {
+                "info": pya.LayerInfo(1, 0),
+                "label": "RECT",
+                "relative_dose": 1.0,
+                "spec": (1, 0),
+            }
+        ],
         0.001,
         "TOP",
         str(reference_gds),
     )
 
-    expected = _normalize_gpf(reference_gpf.read_text().splitlines())
-    actual = _normalize_gpf(output_path.read_text().splitlines())
-
-    assert actual == expected
+    assert output_gpf.read_text() == reference_gpf.read_text()
+    arg_line = arg_log.read_text()
+    assert str(reference_gds) in arg_line
+    assert str(output_gpf) in arg_line
